@@ -57,12 +57,12 @@ function convertGPSToExif(lat, lng) {
   };
 }
 
-// Inject EXIF metadata into WebP image
-async function injectExifMetadata(webpBuffer) {
+// Inject EXIF metadata into JPEG image (BEFORE WebP conversion)
+function injectExifIntoJpeg(jpegBuffer) {
   try {
-    // Convert WebP buffer to base64 data URL
-    const base64Image = webpBuffer.toString('base64');
-    const dataUrl = `data:image/webp;base64,${base64Image}`;
+    // Convert JPEG buffer to base64 data URL
+    const base64Image = jpegBuffer.toString('base64');
+    const dataUrl = `data:image/jpeg;base64,${base64Image}`;
     
     // Create EXIF object
     const zeroth = {};
@@ -90,16 +90,15 @@ async function injectExifMetadata(webpBuffer) {
     // Generate EXIF bytes
     const exifBytes = piexifjs.dump(exifObj);
     
-    // Insert EXIF into image
+    // Insert EXIF into JPEG
     const newDataUrl = piexifjs.insert(exifBytes, dataUrl);
     
     // Convert back to buffer
-    const base64Data = newDataUrl.replace(/^data:image\/webp;base64,/, '');
+    const base64Data = newDataUrl.replace(/^data:image\/jpeg;base64,/, '');
     return Buffer.from(base64Data, 'base64');
   } catch (error) {
     console.error('EXIF injection error:', error);
-    // Return original buffer if EXIF injection fails
-    return webpBuffer;
+    throw new Error('Failed to inject EXIF metadata into image');
   }
 }
 
@@ -129,11 +128,12 @@ app.post('/process', upload.single('image'), async (req, res) => {
     const baseName = path.parse(originalName).name;
     const newFilename = `${baseName}.webp`;
 
-    // Process image with Sharp
-    let webpBuffer;
+    // STEP 1: Convert input image to JPEG (if PNG)
+    // This ensures we always work with JPEG for EXIF injection
+    let jpegBuffer;
     try {
-      webpBuffer = await sharp(req.file.buffer)
-        .webp({ quality: quality })
+      jpegBuffer = await sharp(req.file.buffer)
+        .jpeg({ quality: 95 }) // High quality for intermediate JPEG
         .toBuffer();
     } catch (sharpError) {
       return res.status(400).json({ 
@@ -141,18 +141,43 @@ app.post('/process', upload.single('image'), async (req, res) => {
       });
     }
 
-    // Inject EXIF metadata
-    const finalBuffer = await injectExifMetadata(webpBuffer);
+    // STEP 2: Inject EXIF metadata into JPEG
+    let jpegWithExif;
+    try {
+      jpegWithExif = injectExifIntoJpeg(jpegBuffer);
+    } catch (exifError) {
+      return res.status(500).json({ 
+        error: 'Failed to inject EXIF metadata',
+        message: exifError.message 
+      });
+    }
+
+    // STEP 3: Convert JPEG with EXIF to WebP
+    let webpBuffer;
+    try {
+      webpBuffer = await sharp(jpegWithExif)
+        .webp({ 
+          quality: quality,
+          // Preserve metadata during conversion
+          effort: 4 // Balance between compression time and file size
+        })
+        .toBuffer();
+    } catch (conversionError) {
+      return res.status(500).json({ 
+        error: 'Failed to convert image to WebP',
+        message: conversionError.message 
+      });
+    }
 
     // Set response headers
     res.set({
       'Content-Type': 'image/webp',
       'Content-Disposition': `attachment; filename="${newFilename}"`,
-      'Content-Length': finalBuffer.length
+      'Content-Length': webpBuffer.length
     });
 
     // Send the processed image
-    res.send(finalBuffer);
+    res.send(webpBuffer);
 
   } catch (error) {
     console.error('Processing error:', error);
@@ -192,6 +217,3 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
-
-
-
